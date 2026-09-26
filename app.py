@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Grid outage restoration planning, field-report merge and status publishing demo."""
+"""Grid outage restoration planning, capacity reservation ledger, field-report merge and status publishing demo."""
 from __future__ import annotations
 
 import argparse
@@ -23,8 +23,8 @@ def j(value: object) -> str:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
+    def __init__(self, status: int, message: str, details: dict | None = None):
+        super().__init__(message); self.status, self.message, self.details = status, message, details
 
 
 class Store:
@@ -77,6 +77,14 @@ class Store:
           id INTEGER PRIMARY KEY AUTOINCREMENT, outage_id INTEGER NOT NULL REFERENCES outages(id),
           plan_id INTEGER NOT NULL REFERENCES plans(id), version INTEGER NOT NULL, status_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS reservations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES plans(id),
+          outage_id INTEGER NOT NULL REFERENCES outages(id), step_no INTEGER NOT NULL,
+          asset_id INTEGER NOT NULL REFERENCES assets(id), required_mw REAL NOT NULL,
+          window_start TEXT, window_end TEXT,
+          state TEXT NOT NULL CHECK(state IN ('reserved','consumed','released')),
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(plan_id,step_no)
+        );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
@@ -91,8 +99,86 @@ class Store:
     def close(self) -> None: self.conn.close()
 
 
+# ---------------------------------------------------------------------------
+# 业务块一：恢复容量判定（只读）。按步骤资产、容量和恢复窗口计算可用容量，
+# 容量不足时给出冲突事故与时间段，供批准计划和页面待批准区使用。
+# ---------------------------------------------------------------------------
+class CapacityAdvisor:
+    def __init__(self, conn: sqlite3.Connection): self.conn = conn
+
+    @staticmethod
+    def _windows_overlap(a_start: str | None, a_end: str | None, b_start: str | None, b_end: str | None) -> bool:
+        if a_start is None or b_start is None: return True  # 无窗口视为全程占用
+        return a_start < b_end and b_start < a_end
+
+    def conflicts_for(self, plan: sqlite3.Row, steps: list[dict]) -> list[dict]:
+        conflicts = []
+        for step in steps:
+            asset = self.conn.execute("SELECT * FROM assets WHERE code=?", (step["asset"],)).fetchone()
+            if not asset: continue
+            rows = self.conn.execute("""SELECT r.*, o.incident_code FROM reservations r JOIN outages o ON o.id=r.outage_id
+                                        WHERE r.asset_id=? AND r.state IN ('reserved','consumed') AND r.outage_id<>?""",
+                                     (asset["id"], plan["outage_id"])).fetchall()
+            blocking = [row for row in rows if self._windows_overlap(step.get("window_start"), step.get("window_end"), row["window_start"], row["window_end"])]
+            available = round(float(asset["capacity_mw"]) - sum(float(row["required_mw"]) for row in blocking), 6)
+            if float(step["required_mw"]) > available:
+                conflicts.append({"step_seq": int(step["seq"]), "asset": step["asset"],
+                                  "required_mw": float(step["required_mw"]), "available_mw": available,
+                                  "window": [step.get("window_start"), step.get("window_end")],
+                                  "conflicts_with": [{"incident_code": row["incident_code"], "plan_id": row["plan_id"], "step_no": row["step_no"],
+                                                      "state": row["state"], "required_mw": row["required_mw"],
+                                                      "window": [row["window_start"], row["window_end"]]} for row in blocking]})
+        return conflicts
+
+
+# ---------------------------------------------------------------------------
+# 业务块二：容量预占台账。批准时占位，计划变更或被替换时释放旧占位，
+# 关键步骤现场确认后转为已消耗；released 记录保留用于追溯。
+# ---------------------------------------------------------------------------
+class ReservationLedger:
+    def __init__(self, conn: sqlite3.Connection): self.conn = conn
+
+    def reserve_plan(self, plan: sqlite3.Row, steps: list[dict], skip_step_nos: set[int] = frozenset()) -> int:
+        count = 0
+        for step in steps:
+            if int(step["seq"]) in skip_step_nos: continue  # 已确认步骤的容量已在旧版本转为消耗
+            asset = self.conn.execute("SELECT id FROM assets WHERE code=?", (step["asset"],)).fetchone()
+            self.conn.execute("""INSERT INTO reservations(plan_id,outage_id,step_no,asset_id,required_mw,window_start,window_end,state,created_at,updated_at)
+                                 VALUES(?,?,?,?,?,?,?,'reserved',?,?)
+                                 ON CONFLICT(plan_id,step_no) DO UPDATE SET required_mw=excluded.required_mw,window_start=excluded.window_start,
+                                     window_end=excluded.window_end,state='reserved',updated_at=excluded.updated_at""",
+                              (plan["id"], plan["outage_id"], int(step["seq"]), asset["id"], float(step["required_mw"]),
+                               step.get("window_start"), step.get("window_end"), now(), now()))
+            count += 1
+        return count
+
+    def release_plan(self, plan_id: int) -> int:
+        return self.conn.execute("UPDATE reservations SET state='released',updated_at=? WHERE plan_id=? AND state='reserved'", (now(), plan_id)).rowcount
+
+    def consume_step(self, plan_id: int, step_no: int) -> int:
+        return self.conn.execute("UPDATE reservations SET state='consumed',updated_at=? WHERE plan_id=? AND step_no=? AND state='reserved'", (now(), plan_id, step_no)).rowcount
+
+    def overview(self) -> dict:
+        entries = [dict(row) for row in self.conn.execute("""SELECT r.*, a.code AS asset_code, a.name AS asset_name, o.incident_code
+                                                             FROM reservations r JOIN assets a ON a.id=r.asset_id JOIN outages o ON o.id=r.outage_id
+                                                             WHERE r.state IN ('reserved','consumed') ORDER BY r.id""")]
+        usage: dict[int, dict[str, float]] = {}
+        for entry in entries:
+            slot = usage.setdefault(entry["asset_id"], {"reserved_mw": 0.0, "consumed_mw": 0.0})
+            slot["reserved_mw" if entry["state"] == "reserved" else "consumed_mw"] += float(entry["required_mw"])
+        assets = []
+        for asset in self.conn.execute("SELECT * FROM assets ORDER BY id"):
+            used = usage.get(asset["id"], {"reserved_mw": 0.0, "consumed_mw": 0.0})
+            assets.append({"id": asset["id"], "code": asset["code"], "name": asset["name"], "capacity_mw": asset["capacity_mw"],
+                           "reserved_mw": used["reserved_mw"], "consumed_mw": used["consumed_mw"],
+                           "available_mw": round(float(asset["capacity_mw"]) - used["reserved_mw"] - used["consumed_mw"], 6)})
+        return {"assets": assets, "reservations": entries}
+
+
 class GridService:
-    def __init__(self, store: Store): self.store, self.conn = store, store.conn
+    def __init__(self, store: Store):
+        self.store, self.conn = store, store.conn
+        self.capacity, self.ledger = CapacityAdvisor(store.conn), ReservationLedger(store.conn)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -175,16 +261,26 @@ class GridService:
         actor = self._actor(actor, role, {"dispatcher"}); plan = self._row("plans", plan_id)
         if plan["state"] != "submitted": raise ApiError(409, "只有已提交计划可以批准")
         self._validate_safety(plan)
-        self._plan_update(plan, "approved", expected_revision, actor, "plan.approve", {"note": note})
-        self.conn.execute("UPDATE plans SET approved_by=?,approved_at=? WHERE id=?", (actor, now(), plan_id))
-        self.conn.commit()
+        if int(expected_revision) != int(plan["revision"]): raise ApiError(409, "计划版本冲突")
+        steps = json.loads(plan["steps_json"])
+        conflicts = self.capacity.conflicts_for(plan, steps)
+        if conflicts: raise ApiError(409, "恢复容量不足，计划保留在待批准区", {"plan_id": plan_id, "conflicts": conflicts})
+        confirmed = {row["step_no"] for row in self.conn.execute("SELECT step_no FROM confirmations WHERE plan_id=? AND status='confirmed'", (plan_id,))}
+        with self.conn:
+            cur = self.conn.execute("UPDATE plans SET state='approved',revision=revision+1,approved_by=?,approved_at=? WHERE id=? AND revision=?",
+                                    (actor, now(), plan_id, expected_revision))
+            if cur.rowcount != 1: raise ApiError(409, "并发计划更新冲突")
+            reserved = self.ledger.reserve_plan(plan, steps, skip_step_nos=confirmed)
+            self.store.audit(actor, "plan.approve", "plan", plan_id, {"note": note, "reserved_steps": reserved})
         return self._plan_dict(self._row("plans", plan_id))
 
     def activate_plan(self, actor: str | None, role: str | None, plan_id: int, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"dispatcher"}); plan = self._row("plans", plan_id)
         if plan["state"] != "approved": raise ApiError(409, "计划尚未批准")
+        superseded = [row["id"] for row in self.conn.execute("SELECT id FROM plans WHERE outage_id=? AND state='active'", (plan["outage_id"],))]
         with self.conn:
             self.conn.execute("UPDATE plans SET state='superseded' WHERE outage_id=? AND state='active'", (plan["outage_id"],))
+            for old_plan_id in superseded: self.ledger.release_plan(old_plan_id)
             updated = self.conn.execute("UPDATE plans SET state='active',revision=revision+1,activated_at=? WHERE id=? AND revision=?",
                                         (now(), plan_id, expected_revision))
             if updated.rowcount != 1: raise ApiError(409, "计划版本冲突")
@@ -208,8 +304,9 @@ class GridService:
             cur = self.conn.execute("INSERT INTO plans(outage_id,version,state,steps_json,created_by,created_at) VALUES(?,?, 'draft',?,?,?)",
                                     (outage["id"], version, j(normalized), actor, now()))
             self.conn.execute("UPDATE plans SET state='superseded' WHERE id=?", (base_plan_id,))
+            released = self.ledger.release_plan(base_plan_id)
             self._copy_confirmations(base_plan_id, cur.lastrowid, normalized, confirmed)
-            self.store.audit(actor, "plan.change_create", "plan", cur.lastrowid, {"base_plan": base_plan_id, "version": version, "carried_confirmations": len(confirmed)})
+            self.store.audit(actor, "plan.change_create", "plan", cur.lastrowid, {"base_plan": base_plan_id, "version": version, "carried_confirmations": len(confirmed), "released_reservations": released})
         return self._plan_dict(self._row("plans", cur.lastrowid))
 
     def field_report(self, actor: str | None, role: str | None, plan_id: int, step_no: int, client_report_id: str, expected_plan_version: int, status: str, note: str = "") -> dict:
@@ -249,7 +346,8 @@ class GridService:
             self.conn.execute("""INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note) VALUES(?,?,?,?,?,?)
                                ON CONFLICT(plan_id,step_no) DO UPDATE SET status=excluded.status,confirmed_by=excluded.confirmed_by,confirmed_at=excluded.confirmed_at,note=excluded.note""",
                               (plan_id, step_no, decision, actor, now(), note))
-            self.store.audit(actor, "plan.confirm_step", "plan", plan_id, {"step_no": step_no, "status": decision, "note": note})
+            consumed = bool(decision == "confirmed" and steps[step_no].get("critical") and self.ledger.consume_step(plan_id, step_no))
+            self.store.audit(actor, "plan.confirm_step", "plan", plan_id, {"step_no": step_no, "status": decision, "note": note, "capacity_consumed": consumed})
         return dict(self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone())
 
     def publish_status(self, actor: str | None, role: str | None, outage_id: int, plan_id: int) -> dict:
@@ -282,12 +380,26 @@ class GridService:
             if required > float(asset["capacity_mw"]): raise ApiError(409, f"步骤 {seq} 超过资产安全容量")
             deps = [int(x) for x in raw.get("depends_on", [])]
             if any(dep >= seq for dep in deps): raise ApiError(400, "依赖步骤必须位于当前步骤之前")
-            seqs.add(seq); normalized.append({"seq": seq, "action": str(raw.get("action", "energize")), "asset": asset_code,
-                                                  "required_mw": required, "depends_on": deps, "critical": bool(raw.get("critical", False))})
+            window_start, window_end = raw.get("window_start"), raw.get("window_end")
+            if (window_start is None) != (window_end is None): raise ApiError(400, "恢复窗口需要成对的起止时间")
+            if window_start is not None:
+                window_start, window_end = self._canonical_time(window_start), self._canonical_time(window_end)
+                if not window_start < window_end: raise ApiError(400, "恢复窗口开始时间必须早于结束时间")
+            step = {"seq": seq, "action": str(raw.get("action", "energize")), "asset": asset_code,
+                    "required_mw": required, "depends_on": deps, "critical": bool(raw.get("critical", False))}
+            if window_start is not None: step["window_start"], step["window_end"] = window_start, window_end
+            seqs.add(seq); normalized.append(step)
         available = {row["seq"]: set(row["depends_on"]) for row in normalized}
         for seq, deps in available.items():
             if not deps.issubset(seqs): raise ApiError(400, f"步骤 {seq} 含有未知依赖")
         return sorted(normalized, key=lambda x: x["seq"])
+
+    @staticmethod
+    def _canonical_time(value: object) -> str:
+        try: moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError as exc: raise ApiError(400, "恢复窗口时间格式不合法") from exc
+        if moment.tzinfo is None: moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def _validate_safety(self, plan: sqlite3.Row) -> None:
         for step in json.loads(plan["steps_json"]):
@@ -312,7 +424,17 @@ class GridService:
     def plan_detail(self, plan_id: int) -> dict:
         plan = self._plan_dict(self._row("plans", plan_id))
         return {"plan": plan, "confirmations": [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))],
-                "field_reports": [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))]}
+                "field_reports": [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))],
+                "reservations": [dict(row) for row in self.conn.execute("SELECT * FROM reservations WHERE plan_id=? ORDER BY step_no", (plan_id,))]}
+
+    def capacity_overview(self) -> dict:
+        overview = self.ledger.overview()
+        pending = []
+        for plan in self.conn.execute("SELECT p.*, o.incident_code FROM plans p JOIN outages o ON o.id=p.outage_id WHERE p.state='submitted' ORDER BY p.id"):
+            conflicts = self.capacity.conflicts_for(plan, json.loads(plan["steps_json"]))
+            if conflicts: pending.append({"plan_id": plan["id"], "outage_id": plan["outage_id"], "incident_code": plan["incident_code"], "conflicts": conflicts})
+        overview["pending_conflicts"] = pending
+        return overview
 
     def _outage_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "incident_code": row["incident_code"], "title": row["title"], "state": row["state"],
@@ -334,6 +456,7 @@ class GridService:
         if not self.conn.execute("SELECT id FROM assets LIMIT 1").fetchone():
             a = self.register_asset("dispatcher-demo", "dispatcher", "SUB-1", "中心站", "substation", 200, "城区")
             self.register_asset("dispatcher-demo", "dispatcher", "LINE-1", "一号线", "line", 120, "城区", a["id"])
+            self.register_asset("dispatcher-demo", "dispatcher", "BKUP-1", "备用柴油电源", "backup", 60, "城区", a["id"])
             self.register_facility("dispatcher-demo", "dispatcher", "市医院", "hospital", a["id"], 1, 50)
 
 
@@ -354,12 +477,13 @@ class Handler(BaseHTTPRequestHandler):
             p = self._parts()
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "capacity"]: out = self.service.capacity_overview()
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc: self._send(exc.status, {"error": exc.message, **({"details": exc.details} if exc.details else {})})
         except Exception as exc: self._send(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -379,7 +503,7 @@ class Handler(BaseHTTPRequestHandler):
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc: self._send(exc.status, {"error": exc.message, **({"details": exc.details} if exc.details else {})})
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc: self._send(400, {"error": str(exc)})
         except Exception as exc: self._send(500, {"error": str(exc)})
 

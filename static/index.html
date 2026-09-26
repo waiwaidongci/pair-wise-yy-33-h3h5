@@ -1,1 +1,47 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title>
+<!-- 业务块三：页面提示。展示容量占用、预占台账和待批准区冲突原因，数据来自 /api/capacity 与 /api/state。 -->
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+table{border-collapse:collapse;width:100%;margin:8px 0 24px}
+th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;font-size:14px}
+th{background:#f3f5f7}
+.reserved{color:#9a6700}.consumed{color:#cf222e}.ok{color:#1a7f37}
+h2{margin-top:28px}h3{margin-bottom:4px}
+</style>
+<h1>电网事故应急与恢复调度</h1>
+<p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离、恢复容量预占台账和状态发布。</p>
+<button onclick="loadAll()">刷新状态</button>
+<h2>恢复容量占用</h2>
+<table id="assets"><thead><tr><th>资产</th><th>名称</th><th>总容量(MW)</th><th>已预占(MW)</th><th>已消耗(MW)</th><th>可用(MW)</th></tr></thead><tbody></tbody></table>
+<h2>预占台账</h2>
+<table id="ledger"><thead><tr><th>事故</th><th>计划</th><th>步骤</th><th>资产</th><th>容量(MW)</th><th>恢复窗口</th><th>状态</th></tr></thead><tbody></tbody></table>
+<h2>待批准区</h2>
+<div id="pending">加载中...</div>
+<h2>系统状态</h2>
+<pre id="state">加载中...</pre>
+<script>
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmtWindow=w=>w&&w[0]?`${esc(w[0])} ~ ${esc(w[1])}`:"全程";
+const STATE_CN={reserved:"预占",consumed:"已消耗",released:"已释放"};
+async function loadAll(){
+  const [state,cap]=await Promise.all([fetch("/api/state").then(r=>r.json()),fetch("/api/capacity").then(r=>r.json())]);
+  document.querySelector("#assets tbody").innerHTML=cap.assets.map(a=>
+    `<tr><td>${esc(a.code)}</td><td>${esc(a.name)}</td><td>${a.capacity_mw}</td><td class="reserved">${a.reserved_mw}</td><td class="consumed">${a.consumed_mw}</td><td class="ok">${a.available_mw}</td></tr>`).join("");
+  document.querySelector("#ledger tbody").innerHTML=cap.reservations.map(r=>
+    `<tr><td>${esc(r.incident_code)}</td><td>#${r.plan_id}</td><td>${r.step_no}</td><td>${esc(r.asset_code)} ${esc(r.asset_name)}</td><td>${r.required_mw}</td><td>${fmtWindow([r.window_start,r.window_end])}</td><td class="${r.state}">${STATE_CN[r.state]||r.state}</td></tr>`).join("")||'<tr><td colspan="7">暂无占用</td></tr>';
+  const conflicts=Object.fromEntries(cap.pending_conflicts.map(p=>[p.plan_id,p.conflicts]));
+  const submitted=state.plans.filter(p=>p.state==="submitted");
+  document.getElementById("pending").innerHTML=submitted.length?submitted.map(p=>{
+    const outage=state.outages.find(o=>o.id===p.outage_id);
+    const body=conflicts[p.id]?conflicts[p.id].map(c=>
+      `<li>步骤 ${c.step_seq}（${esc(c.asset)}）：需要 ${c.required_mw} MW，窗口 ${fmtWindow(c.window)} 内仅剩 ${c.available_mw} MW；冲突：${
+        c.conflicts_with.map(x=>`${esc(x.incident_code)} 计划#${x.plan_id} 步骤${x.step_no}（${STATE_CN[x.state]||x.state} ${x.required_mw} MW，${fmtWindow(x.window)}）`).join("、")}</li>`).join("")
+      :'<li class="ok">容量充足，可批准</li>';
+    return `<h3>计划 #${p.id}（事故 ${esc(outage?outage.incident_code:p.outage_id)}，版本 ${p.version}）</h3><ul>${body}</ul>`;
+  }).join(""):"<p>待批准区为空</p>";
+  document.getElementById("state").textContent=JSON.stringify(state,null,2);
+}
+loadAll();
+</script>
