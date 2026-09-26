@@ -1,1 +1,37 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+table{border-collapse:collapse;margin:12px 0;width:100%}
+td,th{border:1px solid #d0d7de;padding:6px 10px;text-align:left;font-size:14px}
+th{background:#f3f5f7}
+.held{color:#9a6700}.consumed{color:#cf222e}.ok{color:#1a7f37}.bad{color:#cf222e}
+.card{border:1px solid #d0d7de;border-radius:8px;padding:12px 16px;margin:12px 0}
+</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、恢复容量预占台、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button>
+<h2>恢复容量预占看板</h2><div id="board">加载中...</div>
+<h2>待批准计划</h2><div id="pending">加载中...</div>
+<h2>原始状态</h2><pre id="state">加载中...</pre>
+<script>
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtWindow=w=>(!w.start&&!w.end)?"不限":`${w.start||"…"} ~ ${w.end||"…"}`;
+const stateName={held:"预占",consumed:"已消耗",released:"已释放"};
+function renderBoard(board){
+  const rows=board.assets.map(a=>`<tr><td>${esc(a.code)} ${esc(a.name)}</td><td>${a.capacity_mw}</td><td class="held">${a.held_mw}</td><td class="consumed">${a.consumed_mw}</td><td>${a.available_mw}</td></tr>`).join("");
+  const detail=board.assets.flatMap(a=>a.reservations.map(r=>`<tr><td>${esc(a.code)}</td><td>${esc(r.incident_code)}</td><td>计划${r.plan_id} / 步骤${r.step_no}</td><td>${r.required_mw}</td><td>${esc(fmtWindow(r.window))}</td><td class="${r.state}">${stateName[r.state]||r.state}</td></tr>`)).join("");
+  document.getElementById("board").innerHTML=`<table><tr><th>资产</th><th>容量(MW)</th><th>预占</th><th>已消耗</th><th>可用</th></tr>${rows}</table><h3>占用明细</h3>${detail?`<table><tr><th>资产</th><th>事故</th><th>计划/步骤</th><th>容量(MW)</th><th>恢复窗口</th><th>状态</th></tr>${detail}</table>`:"<p>当前没有占用。</p>"}`;
+}
+function renderPending(board){
+  const el=document.getElementById("pending");
+  if(!board.pending_plans.length){el.innerHTML="<p>待批准区为空。</p>";return}
+  el.innerHTML=board.pending_plans.map(p=>{
+    const conflicts=p.conflicts.map(c=>`<li>步骤${c.step_seq} ${esc(c.asset)}：需 ${c.required_mw}MW / 可用 ${c.available_mw}MW，窗口 ${esc(fmtWindow(c.window))}；冲突：${c.competitors.map(x=>`${esc(x.incident_code)}（计划${x.plan_id} 步骤${x.step_no}，${stateName[x.state]} ${x.required_mw}MW，${esc(fmtWindow(x.window))}）`).join("；")||"同计划步骤叠加"}</li>`).join("");
+    return `<div class="card"><b>计划 ${p.plan_id}</b>（事故 ${esc(p.incident_code)}，v${p.version}） <span class="${p.fits?"ok":"bad"}">${p.hint}</span>${conflicts?`<ul>${conflicts}</ul>`:""}</div>`;
+  }).join("");
+}
+async function loadState(){
+  const s=await (await fetch("/api/state")).json();
+  renderBoard(s.capacity_board);renderPending(s.capacity_board);
+  document.getElementById("state").textContent=JSON.stringify(s,null,2);
+}
+loadState()
+</script></html>
